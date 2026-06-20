@@ -1,0 +1,3 @@
+pandas
+numpy
+st-gsheets-connection

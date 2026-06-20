@@ -6,104 +6,117 @@ from streamlit_gsheets import GSheetsConnection
 # Configuração da página
 st.set_page_config(page_title="Gestão de Divergência", layout="wide")
 
-# 1. Conexão com Google Sheets
+# Conexão com Google Sheets
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 PLANILHA_ABA_DADOS = "Página1"
-# Pela sua imagem, o nome da aba criada ficou "Fornecedor"
 PLANILHA_ABA_CONFIG = "Fornecedor" 
 
-# 2. Função para ler os dados e as configurações
+# Função para ler os dados e as configurações
 @st.cache_data(ttl=5)
 def carregar_dados():
     colunas_padrao = ["Data", "NF", "Cód", "Fornecedor", "Produtos", "Comprador", "Loja", "R$ Diferença", "Protocolo"]
     
-    # --- LER DADOS PRINCIPAIS ---
+    # --- 1. LER DADOS PRINCIPAIS ---
     try:
         df_dados = conn.read(worksheet=PLANILHA_ABA_DADOS, usecols=list(range(len(colunas_padrao))))
         if df_dados.empty or len(df_dados.columns) < len(colunas_padrao):
             df_dados = pd.DataFrame(columns=colunas_padrao)
         df_dados = df_dados.dropna(how='all')
         
-        # Converte para formato de data para o Streamlit entender o calendário
-        df_dados['Data'] = pd.to_datetime(df_dados['Data'], errors='coerce', dayfirst=True).dt.date
+        # Converte para formato de data real para o calendário funcionar em DD/MM/YYYY
+        df_dados['Data'] = pd.to_datetime(df_dados['Data'], format='%d/%m/%Y', errors='coerce').dt.date
     except Exception:
         df_dados = pd.DataFrame(columns=colunas_padrao)
 
-    # --- LER CONFIGURAÇÕES (Aba Fornecedor) ---
+    # --- 2. LER CONFIGURAÇÕES (Aba Fornecedor) ---
     try:
-        # Lendo as colunas A (Cod), B (Fornecedor) até E (Comprador) -> índices 0 a 4
-        df_config = conn.read(worksheet=PLANILHA_ABA_CONFIG, usecols=[0, 1, 2, 3, 4])
-        df_config.columns = ['Cod', 'Fornecedor', 'C', 'D', 'Comprador']
+        # Lê a aba de configurações inteira
+        df_config = conn.read(worksheet=PLANILHA_ABA_CONFIG)
         
-        # Limpar casas decimais dos códigos (ex: o Sheets pode ler "19" como "19.0")
-        df_config['Cod'] = df_config['Cod'].astype(str).str.replace(r'\.0$', '', regex=True)
+        # Dicionário de Código -> Fornecedor (Colunas A e B -> Índices 0 e 1)
+        codigos = df_config.iloc[:, 0].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+        fornecedores = df_config.iloc[:, 1].astype(str).str.strip()
+        dict_fornecedores = dict(zip(codigos, fornecedores))
         
-        # Criar Dicionário de Código -> Fornecedor
-        dict_fornecedores = dict(zip(df_config['Cod'].dropna(), df_config['Fornecedor'].dropna()))
-        
-        # Criar Lista de Compradores (Coluna E) removendo duplicatas e vazios
-        lista_compradores = df_config['Comprador'].dropna().unique().tolist()
-        lista_compradores = [c for c in lista_compradores if str(c).strip() != '']
+        # Lista de Compradores (Coluna E -> Índice 4)
+        if len(df_config.columns) >= 5:
+            compradores_raw = df_config.iloc[:, 4].dropna().astype(str).str.strip().tolist()
+            # Remove vazios e duplicados
+            lista_compradores = sorted(list(set([c for c in compradores_raw if c and c.lower() != 'nan' and c.lower() != 'none'])))
+        else:
+            lista_compradores = []
+            
     except Exception:
         dict_fornecedores = {}
         lista_compradores = []
 
     return df_dados, dict_fornecedores, lista_compradores
 
-df_divergencia, dict_fornecedores, lista_compradores = carregar_dados()
+# Carrega os dados do Sheets
+df_base, dict_fornecedores, lista_compradores = carregar_dados()
+
+# Inicializa a memória da sessão para permitir atualização em tempo real
+if 'df_divergencia' not in st.session_state:
+    st.session_state['df_divergencia'] = df_base
 
 st.title("📊 Base de Divergências")
-st.write("Edite os dados abaixo. **Data padrão**, **Fornecedor (pelo Cód)** e **Comprador** serão formatados automaticamente ao salvar.")
+st.write("Edite os dados abaixo. Ao digitar o **Cód** e apertar `Enter`, o **Fornecedor** subirá automaticamente.")
 
-# Se a data estiver vazia, preenche com hoje visualmente
-df_divergencia['Data'] = df_divergencia['Data'].fillna(date.today())
+# Garante que as linhas fiquem com a data de hoje visualmente antes de preencher
+st.session_state['df_divergencia']['Data'] = st.session_state['df_divergencia']['Data'].fillna(date.today())
 
-# 3. Interface de Edição (st.data_editor)
+# --- 3. INTERFACE DE EDIÇÃO ---
 df_editado = st.data_editor(
-    df_divergencia,
+    st.session_state['df_divergencia'],
     num_rows="dynamic",
     use_container_width=True,
     column_config={
         "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
         "Cód": st.column_config.TextColumn("Cód"),
-        "Fornecedor": st.column_config.TextColumn("Fornecedor", disabled=True, help="Será preenchido automaticamente ao salvar o Código."),
+        "Fornecedor": st.column_config.TextColumn("Fornecedor", disabled=True),
         "Comprador": st.column_config.SelectboxColumn("Comprador", options=lista_compradores),
         "R$ Diferença": st.column_config.NumberColumn("R$ Diferença", format="R$ %.2f")
     },
     key="editor_dados"
 )
 
-# 4. Tratamento Automático antes de Salvar no Sheets
-# Limpar possíveis "19.0" digitados na tabela principal
-df_editado['Cód'] = df_editado['Cód'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+# --- 4. GATILHO DE PREENCHIMENTO AUTOMÁTICO IMEDIATO ---
+mudou_fornecedor = False
 
-# Função para preencher o Fornecedor com base no dicionário
-def preencher_fornecedor(row):
-    cod = row['Cód']
-    if cod in dict_fornecedores and dict_fornecedores[cod]:
-        return dict_fornecedores[cod]
-    return row['Fornecedor'] # Se não achar, mantém o que estava
+for i in df_editado.index:
+    cod_digitado = str(df_editado.at[i, 'Cód']).replace('.0', '').strip()
+    
+    # Se o código existir e estiver no nosso dicionário
+    if cod_digitado and cod_digitado != 'None' and cod_digitado != 'nan':
+        if cod_digitado in dict_fornecedores:
+            fornecedor_correto = dict_fornecedores[cod_digitado]
+            
+            # Se o fornecedor na tela for diferente do correto, atualizamos
+            if df_editado.at[i, 'Fornecedor'] != fornecedor_correto:
+                df_editado.at[i, 'Fornecedor'] = fornecedor_correto
+                mudou_fornecedor = True
 
-# Aplica a regra do Fornecedor
-df_editado['Fornecedor'] = df_editado.apply(preencher_fornecedor, axis=1)
+# Se detectou que um fornecedor novo subiu, recarrega a tela na mesma hora
+if mudou_fornecedor:
+    st.session_state['df_divergencia'] = df_editado
+    st.rerun()
+else:
+    # Apenas mantém os dados salvos em memória enquanto o usuário digita
+    st.session_state['df_divergencia'] = df_editado
 
-# Garante que as linhas novas sem data fiquem com a data de hoje no banco
-df_editado['Data'] = df_editado['Data'].fillna(date.today())
-# Formata a data para texto no padrão PT-BR para ficar bonito no Google Sheets
-df_editado['Data'] = pd.to_datetime(df_editado['Data'], errors='coerce').dt.strftime('%d/%m/%Y')
-
-# 5. Botão de Salvar
+# --- 5. BOTÃO DE SALVAR NO SHEETS ---
 if st.button("💾 Salvar Alterações", type="primary"):
     with st.spinner("Sincronizando com o Google Sheets..."):
         try:
+            # Prepara a planilha final convertendo a data para texto padrão PT-BR
+            df_salvar = st.session_state['df_divergencia'].copy()
+            df_salvar['Data'] = pd.to_datetime(df_salvar['Data'], errors='coerce').dt.strftime('%d/%m/%Y')
+            
             # Envia para a nuvem
-            conn.update(worksheet=PLANILHA_ABA_DADOS, data=df_editado)
+            conn.update(worksheet=PLANILHA_ABA_DADOS, data=df_salvar)
+            
             st.success("Dados salvos com sucesso!")
-            
-            # Limpa o cache e reinicia a tela para mostrar os Fornecedores preenchidos
-            st.cache_data.clear()
-            st.rerun()
-            
+            st.cache_data.clear() # Limpa o cache
         except Exception as e:
             st.error(f"Erro ao salvar na planilha: {e}")

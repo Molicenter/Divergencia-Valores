@@ -1,126 +1,109 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+from datetime import date
 from streamlit_gsheets import GSheetsConnection
 
 # Configuração da página
 st.set_page_config(page_title="Gestão de Divergência", layout="wide")
-st.title("📊 Gestão - Divergência de Preço")
 
-# 1. Estabelecendo a conexão com o Google Sheets
-# O Streamlit vai buscar as credenciais no arquivo .streamlit/secrets.toml
+# 1. Conexão com Google Sheets
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Nome da aba da sua planilha (conforme a imagem, está como "Página1")
-PLANILHA_ABA = "Página1"
+PLANILHA_ABA_DADOS = "Página1"
+# Pela sua imagem, o nome da aba criada ficou "Fornecedor"
+PLANILHA_ABA_CONFIG = "Fornecedor" 
 
-# Definindo as colunas padrão caso a planilha esteja vazia
-colunas_padrao = ["Data", "NF", "Cód", "Fornecedor", "Produtos", "Comprador", "Loja", "R$ Diferença", "Protocolo"]
-
-# 2. Lendo os dados do Google Sheets
-@st.cache_data(ttl=5) # Cache curto para atualizar rápido, mas não sobrecarregar a API
+# 2. Função para ler os dados e as configurações
+@st.cache_data(ttl=5)
 def carregar_dados():
+    colunas_padrao = ["Data", "NF", "Cód", "Fornecedor", "Produtos", "Comprador", "Loja", "R$ Diferença", "Protocolo"]
+    
+    # --- LER DADOS PRINCIPAIS ---
     try:
-        df = conn.read(worksheet=PLANILHA_ABA, usecols=list(range(len(colunas_padrao))))
-        # Se a planilha estiver totalmente vazia (nova), cria o DataFrame com as colunas
-        if df.empty or len(df.columns) < len(colunas_padrao):
-            df = pd.DataFrame(columns=colunas_padrao)
-        return df.dropna(how='all') # Remove linhas totalmente vazias
-    except Exception as e:
-        st.error(f"Erro ao conectar com a planilha. Verifique o secrets.toml e o compartilhamento. Detalhes: {e}")
-        return pd.DataFrame(columns=colunas_padrao)
+        df_dados = conn.read(worksheet=PLANILHA_ABA_DADOS, usecols=list(range(len(colunas_padrao))))
+        if df_dados.empty or len(df_dados.columns) < len(colunas_padrao):
+            df_dados = pd.DataFrame(columns=colunas_padrao)
+        df_dados = df_dados.dropna(how='all')
+        
+        # Converte para formato de data para o Streamlit entender o calendário
+        df_dados['Data'] = pd.to_datetime(df_dados['Data'], errors='coerce', dayfirst=True).dt.date
+    except Exception:
+        df_dados = pd.DataFrame(columns=colunas_padrao)
 
-df_divergencia = carregar_dados()
+    # --- LER CONFIGURAÇÕES (Aba Fornecedor) ---
+    try:
+        # Lendo as colunas A (Cod), B (Fornecedor) até E (Comprador) -> índices 0 a 4
+        df_config = conn.read(worksheet=PLANILHA_ABA_CONFIG, usecols=[0, 1, 2, 3, 4])
+        df_config.columns = ['Cod', 'Fornecedor', 'C', 'D', 'Comprador']
+        
+        # Limpar casas decimais dos códigos (ex: o Sheets pode ler "19" como "19.0")
+        df_config['Cod'] = df_config['Cod'].astype(str).str.replace(r'\.0$', '', regex=True)
+        
+        # Criar Dicionário de Código -> Fornecedor
+        dict_fornecedores = dict(zip(df_config['Cod'].dropna(), df_config['Fornecedor'].dropna()))
+        
+        # Criar Lista de Compradores (Coluna E) removendo duplicatas e vazios
+        lista_compradores = df_config['Comprador'].dropna().unique().tolist()
+        lista_compradores = [c for c in lista_compradores if str(c).strip() != '']
+    except Exception:
+        dict_fornecedores = {}
+        lista_compradores = []
 
-# 3. Interface de Edição (Estilo Excel)
-st.subheader("Base de Divergências")
-st.write("Edite os dados diretamente na tabela abaixo. Após finalizar, clique em **Salvar Alterações**.")
+    return df_dados, dict_fornecedores, lista_compradores
 
-# O st.data_editor exibe e permite editar os dados
+df_divergencia, dict_fornecedores, lista_compradores = carregar_dados()
+
+st.title("📊 Base de Divergências")
+st.write("Edite os dados abaixo. **Data padrão**, **Fornecedor (pelo Cód)** e **Comprador** serão formatados automaticamente ao salvar.")
+
+# Se a data estiver vazia, preenche com hoje visualmente
+df_divergencia['Data'] = df_divergencia['Data'].fillna(date.today())
+
+# 3. Interface de Edição (st.data_editor)
 df_editado = st.data_editor(
     df_divergencia,
     num_rows="dynamic",
     use_container_width=True,
     column_config={
-        "Data": st.column_config.TextColumn("Data"), # Mantendo como texto simples inicialmente para facilitar a digitação da planilha
-        "R$ Diferença": st.column_config.NumberColumn("R$ Diferença", format="R$ %.2f"),
-        "Protocolo": st.column_config.TextColumn("Protocolo")
+        "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+        "Cód": st.column_config.TextColumn("Cód"),
+        "Fornecedor": st.column_config.TextColumn("Fornecedor", disabled=True, help="Será preenchido automaticamente ao salvar o Código."),
+        "Comprador": st.column_config.SelectboxColumn("Comprador", options=lista_compradores),
+        "R$ Diferença": st.column_config.NumberColumn("R$ Diferença", format="R$ %.2f")
     },
     key="editor_dados"
 )
 
-# Botão para salvar no Google Sheets
-if st.button("💾 Salvar Alterações no Google Sheets", type="primary"):
-    with st.spinner("Salvando..."):
-        # Atualiza a planilha no Google Drive
-        conn.update(worksheet=PLANILHA_ABA, data=df_editado)
-        st.success("Dados salvos com sucesso!")
-        st.cache_data.clear() # Limpa o cache para recarregar os dados novos
+# 4. Tratamento Automático antes de Salvar no Sheets
+# Limpar possíveis "19.0" digitados na tabela principal
+df_editado['Cód'] = df_editado['Cód'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
 
-# 4. Processamento do Dashboard Consolidado
-st.divider()
-st.subheader("Painel Consolidado por Comprador")
+# Função para preencher o Fornecedor com base no dicionário
+def preencher_fornecedor(row):
+    cod = row['Cód']
+    if cod in dict_fornecedores and dict_fornecedores[cod]:
+        return dict_fornecedores[cod]
+    return row['Fornecedor'] # Se não achar, mantém o que estava
 
-df_dash = df_editado.copy()
+# Aplica a regra do Fornecedor
+df_editado['Fornecedor'] = df_editado.apply(preencher_fornecedor, axis=1)
 
-if not df_dash.empty and len(df_dash) > 0:
-    # Tratamento de dados para o cálculo
-    df_dash['R$ Diferença'] = pd.to_numeric(df_dash['R$ Diferença'], errors='coerce').fillna(0)
-    # Tem ação se o protocolo estiver preenchido
-    df_dash['Tem_Acao'] = df_dash['Protocolo'].astype(str).str.strip().replace('None', '').replace('nan', '') != ''
-    
-    # Agrupamentos
-    resumo = df_dash.groupby('Comprador').agg(
-        Qtde=('Comprador', 'count'),
-        Total_RS=('R$ Diferença', 'sum')
-    )
-    
-    acoes = df_dash[df_dash['Tem_Acao']].groupby('Comprador').agg(
-        Acoes=('Comprador', 'count'),
-        RS_Acoes=('R$ Diferença', 'sum')
-    )
-    
-    # Consolidando
-    consolidado = resumo.merge(acoes, on='Comprador', how='left').fillna(0)
-    
-    # Cálculos de Diferença e Percentual
-    consolidado['Reg_Dif'] = consolidado['Acoes'] - consolidado['Qtde']
-    consolidado['Reg_Pct'] = np.where(consolidado['Qtde'] == 0, 0, consolidado['Acoes'] / consolidado['Qtde'])
-    
-    consolidado['RS_Dif'] = consolidado['RS_Acoes'] - consolidado['Total_RS']
-    consolidado['RS_Pct'] = np.where(consolidado['Total_RS'] == 0, 0, consolidado['RS_Acoes'] / consolidado['Total_RS'])
-    
-    consolidado = consolidado[['Qtde', 'Acoes', 'Reg_Dif', 'Reg_Pct', 'Total_RS', 'RS_Acoes', 'RS_Dif', 'RS_Pct']]
-    
-    # Linha de Totais
-    total_row = pd.DataFrame({
-        'Qtde': [consolidado['Qtde'].sum()],
-        'Acoes': [consolidado['Acoes'].sum()],
-        'Reg_Dif': [consolidado['Reg_Dif'].sum()],
-        'Reg_Pct': [consolidado['Acoes'].sum() / consolidado['Qtde'].sum() if consolidado['Qtde'].sum() > 0 else 0],
-        'Total_RS': [consolidado['Total_RS'].sum()],
-        'RS_Acoes': [consolidado['RS_Acoes'].sum()],
-        'RS_Dif': [consolidado['RS_Dif'].sum()],
-        'RS_Pct': [consolidado['RS_Acoes'].sum() / consolidado['Total_RS'].sum() if consolidado['Total_RS'].sum() > 0 else 0]
-    }, index=['Total Compradores'])
-    
-    consolidado = pd.concat([consolidado, total_row])
-    
-    # Exibição do Consolidado
-    st.dataframe(
-        consolidado,
-        use_container_width=True,
-        column_config={
-            "Comprador": st.column_config.TextColumn("Compradores"),
-            "Qtde": st.column_config.NumberColumn("Qtde", format="%d"),
-            "Acoes": st.column_config.NumberColumn("Ações", format="%d"),
-            "Reg_Dif": st.column_config.NumberColumn("<>", format="%d"),
-            "Reg_Pct": st.column_config.ProgressColumn("% (Registros)", format="%.1f%%", min_value=0, max_value=1),
-            "Total_RS": st.column_config.NumberColumn("Total", format="R$ %.2f"),
-            "RS_Acoes": st.column_config.NumberColumn("R$ Ações", format="R$ %.2f"),
-            "RS_Dif": st.column_config.NumberColumn("<>", format="R$ %.2f"),
-            "RS_Pct": st.column_config.ProgressColumn("% (R$)", format="%.1f%%", min_value=0, max_value=1)
-        }
-    )
-else:
-    st.info("A planilha está vazia no momento. Adicione registros na tabela acima e clique em Salvar.")
+# Garante que as linhas novas sem data fiquem com a data de hoje no banco
+df_editado['Data'] = df_editado['Data'].fillna(date.today())
+# Formata a data para texto no padrão PT-BR para ficar bonito no Google Sheets
+df_editado['Data'] = pd.to_datetime(df_editado['Data'], errors='coerce').dt.strftime('%d/%m/%Y')
+
+# 5. Botão de Salvar
+if st.button("💾 Salvar Alterações", type="primary"):
+    with st.spinner("Sincronizando com o Google Sheets..."):
+        try:
+            # Envia para a nuvem
+            conn.update(worksheet=PLANILHA_ABA_DADOS, data=df_editado)
+            st.success("Dados salvos com sucesso!")
+            
+            # Limpa o cache e reinicia a tela para mostrar os Fornecedores preenchidos
+            st.cache_data.clear()
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"Erro ao salvar na planilha: {e}")
